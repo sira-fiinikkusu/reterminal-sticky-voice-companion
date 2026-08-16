@@ -11,9 +11,9 @@ household note that every Sticky in the house announces and mirrors.
 
 ## Features
 
-- **Voice assistant satellite** — wake word or OK-button push-to-talk via
-  Home Assistant's Assist pipeline; works with any conversation agent you
-  have configured.
+- **Voice assistant satellite** — OK-button push-to-talk via Home
+  Assistant's Assist pipeline; works with any conversation agent you have
+  configured.
 - **Ink follow-ups** — the Sticky has no speaker, so the firmware exposes a
   `show_followup` action your automations (or an LLM agent) can call to
   write the *full* final answer onto the display, bypassing the voice
