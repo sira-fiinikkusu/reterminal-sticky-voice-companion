@@ -90,9 +90,17 @@ esphome:
     - priority: -100
       then:
         - lambda: |-
-            id(rearm_delay_ms) =
-                (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER)
-                    ? 75000 : 180000;
+            auto cause = esp_sleep_get_wakeup_cause();
+            if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+              id(rearm_delay_ms) = 75000;         // sensor-only nap
+            } else if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+              id(rearm_delay_ms) = 180000;        // human woke it
+            } else {
+              // Cold boot / reset / fresh flash: leave time for first-boot
+              // Wi-Fi provisioning, which happens on a phone with no device
+              // interaction to extend the grace.
+              id(rearm_delay_ms) = 900000;
+            }
         - if:
             condition:
               lambda: |-
