@@ -1,0 +1,1757 @@
+# =============================================================================
+# reTerminal Sticky — Voice Companion (ESPHome community example)
+# Battery-aware Home Assistant voice satellite + 8-page touch e-ink UI,
+# built on Seeed's reTerminal Sticky ESPHome hardware example.
+# reTerminal Sticky — 语音助手社区示例（基于官方 ESPHome 硬件示例）
+# =============================================================================
+#
+# MCU: ESP32-S3R8 (8 MB octal PSRAM, 32 MB flash)
+# 主控：ESP32-S3R8（8 MB 八核 PSRAM，32 MB 闪存）
+#
+# Hardware list / 硬件清单:
+#   1. 3.97" B/W ePaper 800x480 (SSD1677, SPI)    / 3.97 英寸黑白墨水屏
+#   2. 3x buttons (UP=GPIO5, DOWN=GPIO6, OK=GPIO4) / 3 个按键
+#   3. Buzzer (GPIO48, PWM)                        / 蜂鸣器
+#   4. Battery: BQ27220 fuel gauge + BQ25616 charger / 电池：电量计 + 充电管理
+#   5. SHT40 temp & humidity (I2C @0x44)            / SHT40 温湿度
+#   6. PCF8563 RTC (I2C @0x51)                      / PCF8563 实时时钟
+#   7. PDM Microphone (CLK=19, DATA=20, EN=38)     / PDM 麦克风
+#   8. MicroSD (SPI, EN=10, DET=11, CS=8)          / MicroSD 卡槽
+#   9. LSM6DS3TR-C IMU (I2C @0x6A)                 / 六轴 IMU
+#  10. GT911 touch (I2C @0x5D, INT=21, RST=41)     / 电容触摸
+#  11. Deep sleep with GPIO4 ext1 wake-up          / 深度睡眠 + 按键唤醒
+#
+# Critical: GPIO45 (PWR_HOLD) + GPIO46 (PWR_LOCK) must be HIGH at boot,
+# otherwise the device powers off. Handled by the required "power_hold" option.
+# 关键：启动必须拉高 GPIO45/GPIO46，否则断电。由必选项 power_hold 处理。
+#
+# Serial debug: UART0 via CH343P USB-to-UART bridge.
+# 串口调试：通过 CH343P 桥接芯片走 UART0。
+# =============================================================================
+
+substitutions:
+  device_name: reterminal-sticky
+  friendly_name: "reTerminal_Sticky"
+  # Fleet identity: per-unit wrapper files (see unit-two.example.yaml)
+  # override these; the base yaml alone is unit one.
+  unit_label: "Sticky One"
+  # Any 480x800 1-bit PNG, drawn under the main page as a watermark.
+  etch_image: "art/placeholder_etch.png"
+  # Name shown beside voice replies and over the note block.
+  assistant_name: "Assistant"
+  timezone: America/New_York
+
+  # ---- Home Assistant entities (set yours) ----------------------------------
+  # A note slot an agent or automation writes; shown on main + notes pages.
+  note_entity: input_text.assistant_note
+  # A todo list, mirrored through a bridge sensor (see README for HA config).
+  shopping_todo_entity: todo.shopping_list
+  shopping_count_sensor: sensor.sticky_shopping_items
+  agenda_sensor: sensor.sticky_agenda
+  forecast_sensor: sensor.sticky_forecast
+  weather_entity: weather.forecast_home
+  # Household board helpers (input_text) — shared across the whole fleet.
+  board_text_entity: input_text.household_board
+  board_meta_entity: input_text.household_board_meta
+  # ON = never deep-sleep (pin the device awake for OTA sessions).
+  stay_awake_entity: input_boolean.sticky_stay_awake
+
+  # ---- Lights page (six rows; the last row is a fan) ------------------------
+  room_1_label: "Bedroom"
+  room_2_label: "Guest"
+  room_3_label: "Living"
+  room_4_label: "Office"
+  room_5_label: "Sunroom"
+  room_6_label: "Fan"
+  light_1: light.bedroom_1
+  light_2: light.bedroom_2
+  light_3: light.bedroom_3
+  light_4: light.guest_room_1
+  light_5: light.guest_room_2
+  light_6: light.guest_room_3
+  light_7: light.living_room_1
+  light_8: light.living_room_2
+  light_9: light.living_room_3
+  light_10: light.office_1
+  light_11: light.office_2
+  light_12: light.sunroom_1
+  light_13: light.sunroom_2
+  fan_entity: fan.tower_fan
+
+esphome:
+  includes:
+    - usb_jtag_release.h
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # LATE — arm the sleep path unconditionally (a latched prevent with no
+    # later interaction would otherwise keep the device awake forever), pick
+    # the wake budget by wake cause, and paint on the ~30-min cadence.
+    - priority: -100
+      then:
+        - lambda: |-
+            id(rearm_delay_ms) =
+                (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER)
+                    ? 75000 : 180000;
+        - if:
+            condition:
+              lambda: |-
+                auto now_ts = id(rtc_time).now().timestamp;
+                return (long) now_ts - (long) id(last_sched_paint) >= 1700;
+            then:
+              - lambda: |-
+                  id(last_sched_paint) = id(rtc_time).now().timestamp;
+              - component.update: epaper_display
+        - script.execute: rearm_sleep
+    # EARLY (before the I2S driver): detach GPIO19/20 from the USB-Serial-JTAG
+    # peripheral. On a cold boot the pin mux lands with the mic; after a
+    # DEEP-SLEEP wake the USB function reclaims the pins and the PDM mic goes
+    # mute (symptom: every post-sleep-wake voice attempt returns
+    # stt-no-text-recognized). gpio_reset_pin returns them to the GPIO matrix so the I2S
+    # setup that follows gets real pins. The compiler warned about exactly
+    # these pins; now the warning is load-bearing documentation.
+    - priority: 800
+      then:
+        - lambda: |-
+            release_usb_jtag_pins();
+            // Mic power CLEAN CYCLE: during deep sleep GPIO38
+            // floats and the TPS22916 may leave the PDM mic half-powered in a
+            // bad state; force the rail LOW for 150ms so the mic truly resets
+            // before on_boot(600) powers it up fresh.
+            gpio_reset_pin(GPIO_NUM_38);
+            gpio_set_direction(GPIO_NUM_38, GPIO_MODE_OUTPUT);
+            gpio_set_level(GPIO_NUM_38, 0);
+            delay(150);
+    - priority: 600
+      then:
+        # Hold power rails on / 保持电源轨开启
+        - output.turn_on: pwr_hold
+        - output.turn_on: pwr_lock
+        # Turn on touch panel power / 打开触摸供电
+        - switch.turn_on: touch_power_enable
+        # Read RTC time on boot / 启动读取 RTC 时间
+        - pcf8563.read_time:
+        # Turn on SD card power rail / 打开 SD 卡供电
+        - output.turn_on: bsp_sd_enable
+        # Turn on microphone power
+        - output.turn_on: mic_power_enable
+        # Remember whether a button (ext1) woke us — the ready chirp keys on it
+        - lambda: |-
+            if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
+              id(woke_by_button) = true;
+            }
+
+# ESP32-S3R8 — generic S3 board. Octal PSRAM may need a board that enables it,
+# or manual config; adjust if your build does not expose PSRAM.
+# ESP32-S3R8 板级配置；八核 PSRAM 可能需要支持 PSRAM 的板子或手动配置。
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: ESP32S3
+  flash_size: 32MB
+  framework:
+    type: arduino
+    advanced:
+      enable_idf_experimental_features: true
+
+# Serial logging goes to the physical UART0 (CH343P bridge), not USB_CDC.
+# 串口日志走物理 UART0（CH343P 桥接），非 USB_CDC。
+logger:
+  hardware_uart: UART0
+
+# =============================================================================
+# Fonts / 字体
+# =============================================================================
+
+font:
+  - file: "gfonts://Inter@700"
+    id: font_small
+    size: 20
+  - file: "gfonts://Inter@700"
+    id: font_medium
+    size: 32
+  - file: "gfonts://Inter@700"
+    id: font_large
+    size: 48
+  - file: "gfonts://Inter@700"
+    id: font_xl
+    size: 84
+
+# SPI — shared by ePaper display and SD card
+# SPI — 墨水屏与 SD 卡共用（多 CS 设备共用总线）
+spi:
+  clk_pin: GPIO13
+  mosi_pin: GPIO14
+  miso_pin: GPIO12
+
+# I2C sensor bus — SHT4x, PCF8563, BQ27220, LSM6DS3
+# I2C 传感器总线 — 温湿度 / RTC / 电量计 / IMU
+# GPIO0 is an ESP32-S3 strapping pin; keep this bus passive during boot.
+# GPIO0 是 S3 strapping 引脚，启动期间保持该总线被动。
+# I2C touch bus — GT911 touch controller
+# I2C 触摸总线 — GT911 触摸
+i2c:
+  - id: i2c_sensor
+    scl: GPIO0
+    sda: GPIO1
+    frequency: 400kHz
+
+  - id: i2c_touch
+    scl: GPIO2
+    sda: GPIO3
+    frequency: 100kHz
+
+output:
+  # Power latch hold — must be HIGH or the device powers off
+  # 电源锁存，必须为高，否则断电
+  - platform: gpio
+    pin: GPIO45
+    id: pwr_hold
+
+  # Power lock — must be HIGH after boot
+  # 电源锁定，启动后必须为高
+  - platform: gpio
+    pin: GPIO46
+    id: pwr_lock
+  # Microphone power enable (TPS22916 load switch) — HIGH before recording
+  - platform: gpio
+    pin: GPIO38
+    id: mic_power_enable
+
+  # Buzzer PWM output (LEDC) / 蜂鸣器 PWM 输出（LEDC）
+  - platform: ledc
+    pin: GPIO48
+    id: buzzer_pwm
+    frequency: 1000Hz
+
+  # BQ25616 charger enable (GPIO39, active LOW: LOW = charging enabled)
+  # 充电使能（GPIO39，低有效：低电平 = 允许充电）
+  - platform: gpio
+    pin:
+      number: GPIO39
+      inverted: true
+    id: charge_enable
+
+  # SD card power enable / SD 卡供电使能
+  - platform: gpio
+    pin: GPIO10
+    id: bsp_sd_enable
+
+switch:
+  # Touch panel power enable / 触摸面板供电使能
+  - platform: gpio
+    pin: GPIO42
+    id: touch_power_enable
+    internal: true
+    restore_mode: ALWAYS_ON
+    setup_priority: 1100
+
+sensor:
+  # -- Outdoor temperature piped from Home Assistant --------------------------
+  - platform: homeassistant
+    id: ha_out_temp
+    entity_id: ${weather_entity}
+    attribute: temperature
+  # SHT40 temperature & humidity (I2C @0x44)
+  # SHT40 温湿度传感器（I2C 地址 0x44）
+  - platform: sht4x
+    i2c_id: i2c_sensor
+    address: 0x44
+    temperature:
+      name: "Temperature"
+      id: temp_sensor
+    humidity:
+      name: "Relative Humidity"
+      id: hum_sensor
+    update_interval: 60s
+
+  # BQ27220 state-of-charge (I2C @0x55, register 0x2C)
+  # BQ27220 电量百分比（I2C 地址 0x55，寄存器 0x2C）
+  - platform: template
+    id: battery_level
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      uint8_t reg = 0x2C;
+      uint8_t raw[2] = {0, 0};
+      auto err = id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2);
+      if (err != esphome::i2c::ERROR_OK) {
+        return NAN;
+      }
+      return static_cast<float>(static_cast<uint16_t>(raw[0]) | (static_cast<uint16_t>(raw[1]) << 8));
+
+  # BQ27220 battery voltage in millivolts (register 0x08)
+  # BQ27220 电池电压，单位 mV（寄存器 0x08）
+  - platform: template
+    id: battery_voltage
+    name: "Battery Voltage"
+    unit_of_measurement: "mV"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      uint8_t reg = 0x08;
+      uint8_t raw[2] = {0, 0};
+      auto err = id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2);
+      if (err != esphome::i2c::ERROR_OK) {
+        return NAN;
+      }
+      return static_cast<float>(static_cast<uint16_t>(raw[0]) | (static_cast<uint16_t>(raw[1]) << 8));
+
+  # BQ27220 signed charge/discharge current in milliamps (register 0x0C)
+  # BQ27220 充放电电流，单位 mA（寄存器 0x0C，正数表示充电）
+  - platform: template
+    id: battery_current
+    name: "Battery Current"
+    unit_of_measurement: "mA"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      uint8_t reg = 0x0C;
+      uint8_t raw[2] = {0, 0};
+      auto err = id(i2c_sensor).write_readv(0x55, &reg, 1, raw, 2);
+      if (err != esphome::i2c::ERROR_OK) {
+        return NAN;
+      }
+      uint16_t raw_value = static_cast<uint16_t>(raw[0]) | (static_cast<uint16_t>(raw[1]) << 8);
+      return static_cast<float>(static_cast<int16_t>(raw_value));
+
+binary_sensor:
+  # HA override: ON = never sleep (flip + press any button for OTA sessions)
+  - platform: homeassistant
+    id: stay_awake
+    entity_id: ${stay_awake_entity}
+    on_state:
+      then:
+        - if:
+            condition:
+              binary_sensor.is_on: stay_awake
+            then:
+              - deep_sleep.prevent: sleeper
+            else:
+              - script.execute: rearm_sleep
+  # UP button (GPIO5) — short beep
+  # UP 按键（GPIO5）— 短蜂鸣
+  - platform: gpio
+    pin:
+      number: GPIO5
+      mode: INPUT_PULLUP
+      inverted: true
+      allow_other_uses: true
+    id: button_up
+    name: "Button UP"
+    # Page up: one page per press; presses during a refresh (1.8s window) or
+    # while voice is running are ignored so pages can't skip or starve audio.
+    on_press:
+      then:
+        - deep_sleep.prevent: sleeper
+        - lambda: 'id(rearm_delay_ms) = 180000;'
+        - script.execute: rearm_sleep
+        - if:
+            condition:
+              lambda: |-
+                return !id(va).is_running() && (millis() - id(last_page_ms)) > 1800;
+            then:
+              - lambda: 'id(last_page_ms) = millis();'
+              - light.turn_on:
+                  id: buzzer
+                  brightness: 30%
+              - delay: 80ms
+              - light.turn_off: buzzer
+              - display.page.show_previous: epaper_display
+              - lambda: 'id(reply_scroll) = 0;'
+              - component.update: epaper_display
+
+  # DOWN button (GPIO6) — short beep
+  # DOWN 按键（GPIO6）— 短蜂鸣
+  - platform: gpio
+    pin:
+      number: GPIO6
+      mode: INPUT_PULLUP
+      inverted: true
+      allow_other_uses: true
+    id: button_down
+    name: "Button DOWN"
+    # Page down: same gate as page up (see comment there).
+    on_press:
+      then:
+        - deep_sleep.prevent: sleeper
+        - lambda: 'id(rearm_delay_ms) = 180000;'
+        - script.execute: rearm_sleep
+        - if:
+            condition:
+              lambda: |-
+                return !id(va).is_running() && (millis() - id(last_page_ms)) > 1800;
+            then:
+              - lambda: 'id(last_page_ms) = millis();'
+              - light.turn_on:
+                  id: buzzer
+                  brightness: 30%
+              - delay: 80ms
+              - light.turn_off: buzzer
+              - display.page.show_next: epaper_display
+              - lambda: 'id(reply_scroll) = 0;'
+              - component.update: epaper_display
+
+  # OK / Power button (GPIO4) — also deep-sleep wake source
+  # OK / 电源按键（GPIO4）— 同时作为深度睡眠唤醒源
+  - platform: gpio
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+      allow_other_uses: true
+    id: button_ok
+    name: "Button OK"
+    # Press once to talk to the assistant; voice-activity detection ends the
+    # capture naturally (a manual stop CANCELS the pipeline and eats the
+    # audio). Press again mid-listen to cancel.
+    on_press:
+      then:
+        - deep_sleep.prevent: sleeper
+        - lambda: 'id(rearm_delay_ms) = 180000;'
+        - script.execute: rearm_sleep
+        - if:
+            condition:
+              lambda: 'return id(va).is_running();'
+            then:
+              - voice_assistant.stop:
+            else:
+              # On the board page, this press is DICTATION — the stt
+              # result becomes the board note and the pipeline stops there.
+              - lambda: |-
+                  id(msg_mode) =
+                      id(epaper_display).get_active_page() == id(page_board);
+              - light.turn_on:
+                  id: buzzer
+                  brightness: 40%
+              - delay: 120ms
+              - light.turn_off: buzzer
+              - voice_assistant.start:
+
+  # Charging state inferred from BQ27220 current (>20mA means charging)
+  # 充电状态根据 BQ27220 电流判断（大于 20mA 表示充电中）
+  - platform: template
+    id: charging
+    name: "Battery Charging"
+    lambda: |-
+      if (isnan(id(battery_current).state)) {
+        return false;
+      }
+      return id(battery_current).state > 20.0f;
+
+  # SD card detect (GPIO11, LOW = card present)
+  # SD 卡检测（GPIO11，低电平 = 卡已插入）
+  # Note: in ESPHome the SD card is used indirectly (online_image, media_player),
+  # not for direct file I/O like Arduino.
+  # ESPHome 中 SD 卡由特定组件间接使用，不能像 Arduino 直接读写文件。
+  - platform: gpio
+    pin:
+      number: GPIO11
+      mode: INPUT_PULLUP
+      inverted: true
+    id: sd_card_detect
+    name: "SD Card Detected"
+
+light:
+  # Buzzer wrapped as a "light": brightness = volume
+  # 蜂鸣器包装成"灯"实体：亮度 = 音量
+  - platform: monochromatic
+    output: buzzer_pwm
+    name: "Buzzer"
+    id: buzzer
+    default_transition_length: 0s
+
+time:
+  # PCF8563 at I2C address 0x51. Read on boot; HA sync writes back.
+  # PCF8563（I2C 0x51）。启动读取；HA 同步后回写。
+  - platform: pcf8563
+    i2c_id: i2c_sensor
+    id: rtc_time
+    address: 0x51
+    update_interval: never
+    timezone: ${timezone}
+
+  - platform: homeassistant
+    timezone: ${timezone}
+    on_time_sync:
+      then:
+        - pcf8563.write_time:
+
+# Home Assistant native API / Home Assistant 原生 API
+api:
+  # Uncomment for an encrypted Home Assistant connection on personal builds
+  # (generate a key with: openssl rand -base64 32). The public catalog build
+  # ships without encryption so any household can adopt the device directly.
+  # encryption:
+  #   key: !secret api_encryption_key
+  # An external agent can write the final voice reply here (speakerless
+  # satellite: the ack rides the voice pipeline, the full answer lands as ink).
+  actions:
+    - action: show_followup
+      variables:
+        message: string
+      then:
+        - lambda: |-
+            ESP_LOGI("followup", "received %u bytes", (unsigned) message.size());
+            std::string r = message;
+            size_t bp;
+            while ((bp = r.find('[')) != std::string::npos) {
+              size_t bq = r.find(']', bp);
+              if (bq == std::string::npos || bq - bp > 24) break;
+              r.erase(bp, bq - bp + 1);
+              while (bp < r.size() && r[bp] == ' ') r.erase(bp, 1);
+            }
+            id(va_reply) = r;
+            if (id(va_query).empty()) {
+              id(va_query) = "(voice request)";
+            }
+            id(last_chat_ms) = millis();
+            id(reply_scroll) = 0;
+        - script.execute: followup_repaint
+        - script.execute: chat_expiry
+  on_client_connected:
+    - if:
+        condition:
+          lambda: 'return id(woke_by_button);'
+        then:
+          - lambda: 'id(woke_by_button) = false;'
+          - light.turn_on:
+              id: buzzer
+              brightness: 60%
+          - delay: 90ms
+          - light.turn_off: buzzer
+          - delay: 90ms
+          - light.turn_on:
+              id: buzzer
+              brightness: 60%
+          - delay: 90ms
+          - light.turn_off: buzzer
+
+# OTA (Over-The-Air) firmware update / 空中固件更新
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# Wi-Fi settings / Wi-Fi 设置
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "reTerminal-Sticky"
+    password: "ChangeMe123"
+
+captive_portal:
+
+# Lets the Playground browser flasher provision Wi-Fi over the USB serial
+# connection right after flashing — no yaml edit needed for first setup.
+improv_serial:
+
+# =============================================================================
+# [10] GT911 capacitive touch (I2C @0x5D on i2c_touch, 800x480)
+# 电容触摸（GT911，I2C 地址 0x5D，挂载 i2c_touch 总线，800×480）
+# =============================================================================
+touchscreen:
+  - platform: gt911
+    i2c_id: i2c_touch
+    id: sticky_touch
+    # Bind to the display so touch coords arrive already rotated into
+    # the portrait layout frame — no hand-rolled axis mapping.
+    display: epaper_display
+    interrupt_pin: GPIO21
+    reset_pin: GPIO41
+    on_touch:
+      - deep_sleep.prevent: sleeper
+      - lambda: 'id(rearm_delay_ms) = 180000;'
+      - script.execute: rearm_sleep
+      - lambda: |-
+          id(touch_start_y) = touch.y;
+          id(touch_last_y) = touch.y;
+          id(touch_start_x) = touch.x;
+          id(touch_last_x) = touch.x;
+    on_update:
+      - lambda: |-
+          if (!touches.empty()) {
+            id(touch_last_y) = touches[0].y;
+            id(touch_last_x) = touches[0].x;
+          }
+    on_release:
+      - lambda: |-
+          int dy = id(touch_last_y) - id(touch_start_y);
+          int dx = id(touch_last_x) - id(touch_start_x);
+          // Small motion = a tap. NOTE: the touch y-axis arrives MIRRORED
+          // relative to the drawn portrait layout (field-proven on hardware).
+          // Un-mirror for hit-tests only; swipes keep their sign.
+          if (dy > -40 && dy < 40 && dx > -40 && dx < 40) {
+            int x = id(touch_start_x);
+            int y = 800 - id(touch_start_y);   // un-mirror
+            if (id(epaper_display).get_active_page() == id(page_lights)) {
+              // KEEP IN SYNC with page_lights (same order, same grid).
+              // The last slot is the FAN ITSELF, not a light.
+              static const char *LIGHTS[14] = {
+                "${light_1}", "${light_2}", "${light_3}",
+                "${light_4}", "${light_5}", "${light_6}",
+                "${light_7}", "${light_8}", "${light_9}",
+                "${light_10}", "${light_11}",
+                "${light_12}", "${light_13}",
+                "${fan_entity}",
+              };
+              static const int COUNTS[6]  = {3, 3, 3, 2, 2, 1};
+              static const int OFFSETS[6] = {0, 3, 6, 9, 11, 13};
+              text_sensor::TextSensor *ls_all[14] = {
+                id(ls_0), id(ls_1), id(ls_2), id(ls_3), id(ls_4), id(ls_5), id(ls_6),
+                id(ls_7), id(ls_8), id(ls_9), id(ls_10), id(ls_11), id(ls_12), id(ls_13)};
+              int row = (y - 90) / 100;
+              if (row >= 0 && row < 6 && y >= 90 && y < 690) {
+                const char *domain = (row == 5) ? "fan" : "light";
+                if (x < 230) {
+                  // room name tap = whole-room toggle: any on -> all off
+                  bool any_on = false;
+                  std::string ents;
+                  for (int j = 0; j < COUNTS[row]; j++) {
+                    auto *s = ls_all[OFFSETS[row] + j];
+                    if (s->has_state() && s->state == "on") any_on = true;
+                    if (!ents.empty()) ents += ",";
+                    ents += LIGHTS[OFFSETS[row] + j];
+                  }
+                  id(pending_entities) = ents;
+                  id(pending_service) = std::string(domain) + (any_on ? ".turn_off" : ".turn_on");
+                  ESP_LOGI("lights", "room tap -> %s %s",
+                           id(pending_service).c_str(), ents.c_str());
+                } else {
+                  for (int j = 0; j < COUNTS[row]; j++) {
+                    int cx = 260 + j * 80;
+                    if (x >= cx - 38 && x <= cx + 38) {
+                      id(pending_entities) = LIGHTS[OFFSETS[row] + j];
+                      id(pending_service) = std::string(domain) + ".toggle";
+                      ESP_LOGI("lights", "tap -> %s", id(pending_entities).c_str());
+                      break;
+                    }
+                  }
+                }
+              }
+            } else if (id(epaper_display).get_active_page() == id(page_board)) {
+              // The drawn X, bottom-right — clears the board fleet-wide
+              if (x >= 404 && y >= 700) {
+                id(pending_board_clear) = true;
+                ESP_LOGI("board", "clear tapped");
+              }
+            } else if (id(epaper_display).get_active_page() == id(page_shopping)) {
+              // Check-off circles — right edge of each item row.
+              // Geometry mirrors the page draw: items at y=84 step 42,
+              // circle center (436, y+10).
+              if (x >= 404 && id(ha_shopping).has_state()) {
+                int idx = (y - 74) / 42;
+                if (idx >= 0 && y >= 74) {
+                  std::string all = id(ha_shopping).state;
+                  std::string line;
+                  int n = 0;
+                  for (size_t i = 0; i <= all.size(); i++) {
+                    char ch = i < all.size() ? all[i] : '\n';
+                    if (ch != '\n') { line += ch; continue; }
+                    if (!line.empty()) {
+                      if (n == idx) {
+                        id(pending_todo_item) = line;
+                        ESP_LOGI("shopping", "check off -> %s", line.c_str());
+                        break;
+                      }
+                      n++;
+                    }
+                    line.clear();
+                  }
+                }
+              }
+            }
+            return;   // taps never scroll
+          }
+          if (dy > 60 || dy < -60) {
+            // finger up (dy<0) drags the paper up = read further down
+            // (sign verified by a live thumb test — dy>0 advances,
+            // matching the paper feel).
+            int next = id(reply_scroll) + ((dy > 0) ? 3 : -3);
+            if (next < 0) next = 0;
+            if (next > 30) next = 30;
+            if (next != id(reply_scroll)) {
+              id(reply_scroll) = next;
+              id(scroll_dirty) = true;
+              ESP_LOGI("swipe", "reply_scroll -> %d (dy=%d)", next, dy);
+            }
+          }
+      - if:
+          condition:
+            lambda: 'return id(scroll_dirty) && !id(va).is_running();'
+          then:
+            - lambda: 'id(scroll_dirty) = false;'
+            - component.update: epaper_display
+      # A tap selected lights — fire the HA action, buzz, repaint after
+      # the state lands. Needs "allow device actions" in HA's ESPHome options.
+      - if:
+          condition:
+            lambda: 'return !id(pending_entities).empty();'
+          then:
+            - homeassistant.service:
+                service: !lambda 'return id(pending_service);'
+                data:
+                  entity_id: !lambda 'return id(pending_entities);'
+            - lambda: |-
+                id(pending_entities).clear();
+                id(pending_service).clear();
+            - light.turn_on:
+                id: buzzer
+                brightness: 40%
+            - delay: 60ms
+            - light.turn_off: buzzer
+            - delay: 1500ms
+            - if:
+                condition:
+                  lambda: 'return !id(va).is_running();'
+                then:
+                  - component.update: epaper_display
+      # A tap checked off a shopping item — complete it in the todo
+      # list; the state-trigger bridge refreshes the sensor, then repaint.
+      - if:
+          condition:
+            lambda: 'return !id(pending_todo_item).empty();'
+          then:
+            - homeassistant.service:
+                service: todo.update_item
+                data:
+                  entity_id: ${shopping_todo_entity}
+                  item: !lambda 'return id(pending_todo_item);'
+                  status: completed
+            - lambda: 'id(pending_todo_item).clear();'
+            - light.turn_on:
+                id: buzzer
+                brightness: 40%
+            - delay: 60ms
+            - light.turn_off: buzzer
+            - delay: 2200ms
+            - if:
+                condition:
+                  lambda: 'return !id(va).is_running();'
+                then:
+                  - component.update: epaper_display
+      # The board X — wipe both helpers; every unit repaints via the mirror
+      - if:
+          condition:
+            lambda: 'return id(pending_board_clear);'
+          then:
+            - lambda: 'id(pending_board_clear) = false;'
+            - homeassistant.service:
+                service: input_text.set_value
+                data:
+                  entity_id: ${board_text_entity}
+                  value: ""
+            - homeassistant.service:
+                service: input_text.set_value
+                data:
+                  entity_id: ${board_meta_entity}
+                  value: ""
+            - light.turn_on:
+                id: buzzer
+                brightness: 40%
+            - delay: 60ms
+            - light.turn_off: buzzer
+
+# -----------------------------------------------------------------------------
+# [4] BQ27220 fuel gauge (I2C @0x55 on i2c_sensor)
+# BQ27220 电量计（I2C 地址 0x55，挂载 i2c_sensor 总线）
+# The sensors above read BQ27220 registers directly with ESPHome's I2C bus API.
+# 上面的传感器通过 ESPHome I2C 总线 API 直接读取 BQ27220 寄存器。
+# -----------------------------------------------------------------------------
+
+
+# =============================================================================
+# [1] ePaper display (3.97" B/W, 800x480, SSD1677, SPI)
+# 墨水屏（3.97 英寸黑白，800×480，SSD1677）
+# The "seeed-reterminal-sticky" model preset (ESPHome PR #16950) auto-fills
+# cs_pin=GPIO15, dc_pin=GPIO16, reset_pin=GPIO17, busy_pin=GPIO18,
+# enable_pin=GPIO47, mirror_x, and 10 MHz data rate. Requires ESPHome dev.
+# 模型预设自动填充墨水屏引脚与参数，需 ESPHome dev 版本。
+# =============================================================================
+
+# Deep sleep (battery survival): wake for run_duration, refresh, sleep.
+# ANY button (OK/UP/DOWN) wakes instantly — ESP32-S3 is ext1-only, ANY_LOW
+# fits the active-low buttons. Activity (any button press) holds the device
+# awake 3 minutes via rearm_sleep; the ${stay_awake_entity} helper in HA pins
+# it awake for OTA sessions. E-ink keeps the last frame while asleep.
+deep_sleep:
+  id: sleeper
+  run_duration: 4min
+  # 15-min check-ins: sensors and board catch-up land quickly while the
+  # screen keeps its ~30-min repaint cadence via last_sched_paint.
+  sleep_duration: 15min
+  esp32_ext1_wakeup:
+    pins:
+      - number: GPIO4
+        mode: INPUT_PULLUP
+        allow_other_uses: true
+      - number: GPIO5
+        mode: INPUT_PULLUP
+        allow_other_uses: true
+      - number: GPIO6
+        mode: INPUT_PULLUP
+        allow_other_uses: true
+    mode: ANY_LOW
+
+script:
+  # A pushed follow-up must PAINT as soon as the voice session ends — the
+  # push often lands while the voice pipeline is still wrapping up, and an
+  # inline guard would drop the repaint (full text sits invisible until the
+  # 65s expiry sweep). Bounded wait, then one paint; restart = newest wins.
+  - id: followup_repaint
+    mode: restart
+    then:
+      - wait_until:
+          condition:
+            lambda: 'return !id(va).is_running();'
+          timeout: 20s
+      - component.update: epaper_display
+  # One-shot redraw shortly after the last chat so the 60s hide actually
+  # paints; mode restart = every new exchange pushes the sweep out
+  - id: chat_expiry
+    mode: restart
+    then:
+      - delay: 65s
+      - if:
+          condition:
+            lambda: 'return !id(va).is_running();'
+          then:
+            - component.update: epaper_display
+  - id: rearm_sleep
+    mode: restart
+    then:
+      - delay: !lambda 'return id(rearm_delay_ms);'
+      # Prune-and-retry instead of one-shot: a single condition check would
+      # leave the device awake FOREVER if the timer ledger ever held a stale
+      # line — expired lines (>120s past ring, alarm long fired) are dropped
+      # each pass and sleep happens the moment the gate truly clears. An
+      # active timer or stay-awake still hold the device, as designed.
+      - while:
+          condition:
+            lambda: |-
+              return id(stay_awake).state || !id(timers_state).empty()
+                  || id(va).is_running();
+          then:
+            - delay: 30s
+            - lambda: |-
+                if (id(timers_state).empty()) return;
+                auto now_ts = id(rtc_time).now().timestamp;
+                std::string out, line;
+                for (char ch : id(timers_state) + std::string("\n")) {
+                  if (ch != '\n') { line += ch; continue; }
+                  if (!line.empty()) {
+                    auto p = line.rfind('|');
+                    long end_ts = (p == std::string::npos) ? 0 : atol(line.c_str() + p + 1);
+                    if (end_ts + 120 > (long) now_ts) out += line + "\n";
+                  }
+                  line.clear();
+                }
+                id(timers_state) = out;
+      - deep_sleep.allow: sleeper
+      - deep_sleep.enter: sleeper
+  # After a fleet announce, drift back home from the board page
+  - id: board_return_home
+    mode: restart
+    then:
+      - delay: 60s
+      - if:
+          condition:
+            lambda: |-
+              return id(epaper_display).get_active_page() == id(page_board)
+                  && !id(va).is_running();
+          then:
+            - display.page.show: page_main
+            - component.update: epaper_display
+  # The timer alarm — three triple-beep bursts, unmissable from a desk.
+  - id: timer_alarm
+    mode: single
+    then:
+      # inner burst unrolled: nested repeats collide on ESPHome codegen
+      - repeat:
+          count: 3
+          then:
+            - light.turn_on:
+                id: buzzer
+                brightness: 90%
+            - delay: 180ms
+            - light.turn_off: buzzer
+            - delay: 120ms
+            - light.turn_on:
+                id: buzzer
+                brightness: 90%
+            - delay: 180ms
+            - light.turn_off: buzzer
+            - delay: 120ms
+            - light.turn_on:
+                id: buzzer
+                brightness: 90%
+            - delay: 180ms
+            - light.turn_off: buzzer
+            - delay: 450ms
+
+# I2S audio bus — onboard PDM microphone (lrclk pin doubles as PDM clock)
+i2s_audio:
+  i2s_lrclk_pin: GPIO19
+
+microphone:
+  - platform: i2s_audio
+    id: onboard_mic
+    adc_type: external
+    pdm: true
+    i2s_din_pin: GPIO20
+    channel: left
+    sample_rate: 16000
+    bits_per_sample: 16bit
+
+globals:
+  - id: va_query
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: va_reply
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: woke_by_button
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: last_page_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Stamp of the last voice-chat activity; main page hides its chat block
+  # after 60s idle (page_notes keeps the full exchange — that is its job)
+  - id: last_chat_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Swipe scroll: reply_scroll = wrapped lines consumed before
+  # painting; touch_*_y are display-space (portrait) coords; scroll_dirty
+  # defers the repaint decision out of the release lambda.
+  - id: reply_scroll
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: touch_start_y
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: touch_last_y
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: scroll_dirty
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # X-axis for tap-vs-swipe + the toggle a tap selected + VA timer mirror
+  - id: touch_start_x
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: touch_last_x
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: pending_service
+    type: std::string
+    restore_value: no
+  - id: pending_entities
+    type: std::string
+    restore_value: no
+  - id: timers_state
+    type: std::string
+    restore_value: no
+  # Wake budget (ms) — 75s for sensor-only timer wakes, 3min for humans.
+  - id: rearm_delay_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '180000'
+  # Epoch of the last cadence paint; RTC-persisted across deep sleep.
+  - id: last_sched_paint
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: pending_todo_item
+    type: std::string
+    restore_value: no
+  # Board state
+  - id: msg_mode
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: just_wrote
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: board_new
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: pending_board_clear
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # survives deep sleep (RTC): an unchanged note never re-announces on wake
+  - id: board_hash
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: pending_board
+    type: std::string
+    restore_value: no
+  - id: pending_board_meta
+    type: std::string
+    restore_value: no
+
+# Push-to-talk voice: hold OK, speak, release. Reply renders on the e-ink.
+voice_assistant:
+  id: va
+  microphone: onboard_mic
+  use_wake_word: false
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  volume_multiplier: 4.0
+  on_timer_started:
+    - deep_sleep.prevent: sleeper
+    - script.execute: rearm_sleep
+    - lambda: |-
+        // rebuild the ledger without this timer's line, then re-add it
+        std::string out, line;
+        std::string key = timer.id + std::string("|");
+        for (char ch : id(timers_state) + std::string("\n")) {
+          if (ch != '\n') { line += ch; continue; }
+          if (!line.empty() && line.rfind(key, 0) != 0) out += line + "\n";
+          line.clear();
+        }
+        auto ts = id(rtc_time).now().timestamp;
+        out += timer.id + std::string("|")
+             + (timer.name.empty() ? std::string("Timer") : timer.name)
+             + "|" + std::to_string((unsigned long)(ts + timer.seconds_left)) + "\n";
+        id(timers_state) = out;
+  on_timer_updated:
+    - lambda: |-
+        // rebuild the ledger without this timer's line, then re-add it
+        std::string out, line;
+        std::string key = timer.id + std::string("|");
+        for (char ch : id(timers_state) + std::string("\n")) {
+          if (ch != '\n') { line += ch; continue; }
+          if (!line.empty() && line.rfind(key, 0) != 0) out += line + "\n";
+          line.clear();
+        }
+        auto ts = id(rtc_time).now().timestamp;
+        out += timer.id + std::string("|")
+             + (timer.name.empty() ? std::string("Timer") : timer.name)
+             + "|" + std::to_string((unsigned long)(ts + timer.seconds_left)) + "\n";
+        id(timers_state) = out;
+  on_timer_cancelled:
+    # IMPORTANT: without this handler a cancelled timer's line stays in
+    # the ledger forever and wedges the sleep gate.
+    - lambda: |-
+        std::string out, line;
+        std::string key = timer.id + std::string("|");
+        for (char ch : id(timers_state) + std::string("\n")) {
+          if (ch != '\n') { line += ch; continue; }
+          if (!line.empty() && line.rfind(key, 0) != 0) out += line + "\n";
+          line.clear();
+        }
+        id(timers_state) = out;
+    - script.execute: rearm_sleep
+    - if:
+        condition:
+          lambda: 'return !id(va).is_running();'
+        then:
+          - component.update: epaper_display
+  on_timer_finished:
+    - lambda: |-
+        std::string out, line;
+        std::string key = timer.id + std::string("|");
+        for (char ch : id(timers_state) + std::string("\n")) {
+          if (ch != '\n') { line += ch; continue; }
+          if (!line.empty() && line.rfind(key, 0) != 0) out += line + "\n";
+          line.clear();
+        }
+        id(timers_state) = out;
+    - script.execute: timer_alarm
+    - script.execute: rearm_sleep
+    - if:
+        condition:
+          lambda: 'return !id(va).is_running();'
+        then:
+          - component.update: epaper_display
+  on_stt_end:
+    - if:
+        condition:
+          lambda: 'return id(msg_mode);'
+        then:
+          # Dictation — stamp the board, stop the pipeline before the
+          # conversation stage. The assistant never sees it; it is marker
+          # on a fridge.
+          - lambda: |-
+              id(msg_mode) = false;
+              std::string t = x;
+              if (t.size() > 240) t = t.substr(0, 240);
+              id(va_query).clear();
+              id(just_wrote) = true;
+              char buf[48];
+              auto now = id(rtc_time).now();
+              if (now.is_valid()) {
+                int h12 = now.hour % 12; if (h12 == 0) h12 = 12;
+                snprintf(buf, sizeof(buf), "via ${unit_label} - %d:%02d %s",
+                         h12, now.minute, now.hour < 12 ? "AM" : "PM");
+              } else {
+                snprintf(buf, sizeof(buf), "via ${unit_label}");
+              }
+              id(pending_board) = t;
+              id(pending_board_meta) = buf;
+          - voice_assistant.stop:
+          - homeassistant.service:
+              service: input_text.set_value
+              data:
+                entity_id: ${board_text_entity}
+                value: !lambda 'return id(pending_board);'
+          - homeassistant.service:
+              service: input_text.set_value
+              data:
+                entity_id: ${board_meta_entity}
+                value: !lambda 'return id(pending_board_meta);'
+          - light.turn_on:
+              id: buzzer
+              brightness: 50%
+          - delay: 80ms
+          - light.turn_off: buzzer
+        else:
+          - lambda: |-
+              id(va_query) = x;
+              id(va_reply) = "...";
+              id(last_chat_ms) = millis();
+              id(reply_scroll) = 0;
+          - script.execute: chat_expiry
+          - component.update: epaper_display
+  on_tts_start:
+    - lambda: |-
+        std::string r = x;
+        size_t bp;
+        while ((bp = r.find('[')) != std::string::npos) {
+          size_t bq = r.find(']', bp);
+          if (bq == std::string::npos || bq - bp > 24) break;
+          r.erase(bp, bq - bp + 1);
+          while (bp < r.size() && r[bp] == ' ') r.erase(bp, 1);
+        }
+        id(va_reply) = r;
+        id(last_chat_ms) = millis();
+        id(reply_scroll) = 0;
+    - script.execute: chat_expiry
+    - component.update: epaper_display
+  on_error:
+    - lambda: |-
+        id(msg_mode) = false;
+        id(va_reply) = std::string("(voice error: ") + code.c_str() + ")";
+        id(last_chat_ms) = millis();
+    - script.execute: chat_expiry
+    - component.update: epaper_display
+
+text_sensor:
+  # The timer ledger, visible from HA — sleep-gate questions get answered
+  # by reading, not guessing. Empty string = gate clear.
+  - platform: template
+    name: "Timers Ledger"
+    icon: mdi:timer-sand
+    update_interval: 60s
+    lambda: |-
+      std::string s = id(timers_state);
+      if (s.size() > 250) s.resize(250);
+      return s;
+  # -- Board mirrors: shared note + fleet announce ----------------------------
+  - platform: homeassistant
+    id: hb_meta
+    entity_id: ${board_meta_entity}
+  - platform: homeassistant
+    id: hb_text
+    entity_id: ${board_text_entity}
+    on_value:
+      then:
+        - lambda: |-
+            // announce only a GENUINELY new note, and never to the unit that
+            // wrote it; the RTC hash keeps wake-reboots quiet.
+            uint32_t h = 5381;
+            for (char c : x) h = h * 33 + (uint8_t) c;
+            bool changed = (h != id(board_hash));
+            id(board_hash) = h;
+            bool mine = id(just_wrote);
+            id(just_wrote) = false;
+            id(board_new) = changed && !mine && !x.empty() && x != "unknown";
+        - if:
+            condition:
+              lambda: 'return id(board_new);'
+            then:
+              - lambda: 'id(board_new) = false;'
+              - deep_sleep.prevent: sleeper
+              - lambda: 'id(rearm_delay_ms) = 180000;'
+              - script.execute: rearm_sleep
+              - light.turn_on:
+                  id: buzzer
+                  brightness: 60%
+              - delay: 250ms
+              - light.turn_off: buzzer
+              - display.page.show: page_board
+              - script.execute: board_return_home
+        - if:
+            condition:
+              lambda: 'return !id(va).is_running();'
+            then:
+              - component.update: epaper_display
+
+  # -- Read-only HA state mirrors for the pages -------------------------------
+  - platform: homeassistant
+    id: ha_agenda
+    entity_id: ${agenda_sensor}
+    attribute: events_text
+  - platform: homeassistant
+    id: ha_forecast
+    entity_id: ${forecast_sensor}
+    attribute: forecast_text
+  # 14 light states, SAME ORDER as the touch handler's LIGHTS array
+  - platform: homeassistant
+    id: ls_0
+    entity_id: ${light_1}
+  - platform: homeassistant
+    id: ls_1
+    entity_id: ${light_2}
+  - platform: homeassistant
+    id: ls_2
+    entity_id: ${light_3}
+  - platform: homeassistant
+    id: ls_3
+    entity_id: ${light_4}
+  - platform: homeassistant
+    id: ls_4
+    entity_id: ${light_5}
+  - platform: homeassistant
+    id: ls_5
+    entity_id: ${light_6}
+  - platform: homeassistant
+    id: ls_6
+    entity_id: ${light_7}
+  - platform: homeassistant
+    id: ls_7
+    entity_id: ${light_8}
+  - platform: homeassistant
+    id: ls_8
+    entity_id: ${light_9}
+  - platform: homeassistant
+    id: ls_9
+    entity_id: ${light_10}
+  - platform: homeassistant
+    id: ls_10
+    entity_id: ${light_11}
+  - platform: homeassistant
+    id: ls_11
+    entity_id: ${light_12}
+  - platform: homeassistant
+    id: ls_12
+    entity_id: ${light_13}
+  - platform: homeassistant
+    id: ls_13
+    entity_id: ${fan_entity}
+
+  # -- Weather condition from Home Assistant ----------------------------------
+  - platform: homeassistant
+    id: ha_weather
+    entity_id: ${weather_entity}
+  # -- The assistant note: an input_text an agent or automation writes --------
+  - platform: homeassistant
+    id: assistant_note
+    entity_id: ${note_entity}
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return !id(va).is_running();'
+            then:
+              - component.update: epaper_display
+  # -- Shopping list bridge (sensor.sticky_shopping_items.items_text) --------
+  - platform: homeassistant
+    id: ha_shopping
+    entity_id: ${shopping_count_sensor}
+    attribute: items_text
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return !id(va).is_running();'
+            then:
+              - component.update: epaper_display
+
+# -- Etched watermark drawn under the main page -------------------------------
+image:
+  - file: "${etch_image}"
+    id: etch_art
+    type: BINARY
+
+display:
+  - platform: epaper_spi
+    id: epaper_display
+    model: seeed-reterminal-sticky
+    rotation: 90
+    # Never self-schedule — every draw is a full e-ink refresh, so paints
+    # are explicit: event paths call component.update; the ~30-min cadence
+    # paint is the boot gate on last_sched_paint.
+    update_interval: never
+    pages:
+      - id: page_main
+        lambda: |-
+          // ---- Main page: PORTRAIT 480x800 ----
+          // etched watermark sits under everything; ink=COLOR_OFF like text
+          it.image(0, 0, id(etch_art), COLOR_ON, COLOR_OFF);
+          auto now = id(rtc_time).now();
+          if (now.is_valid()) {
+            it.strftime(24, 18, id(font_medium), COLOR_OFF, "%A", now);
+            it.strftime(24, 58, id(font_small), COLOR_OFF, "%B %d, %Y", now);
+            it.strftime(240, 96, id(font_xl), COLOR_OFF, TextAlign::TOP_CENTER, "%I:%M %p", now);
+          } else {
+            it.printf(24, 96, id(font_medium), COLOR_OFF, "Clock syncing...");
+          }
+          it.line(20, 196, 460, 196, COLOR_OFF);
+
+          it.printf(24, 212, id(font_small), COLOR_OFF, "OUTSIDE");
+          if (id(ha_out_temp).has_state()) {
+            it.printf(24, 240, id(font_large), COLOR_OFF, "%.0f F", id(ha_out_temp).state);
+          } else {
+            it.printf(24, 240, id(font_large), COLOR_OFF, "-- F");
+          }
+          if (id(ha_weather).has_state()) {
+            std::string c = id(ha_weather).state;
+            const char *label = c.c_str();
+            if (c == "partlycloudy") label = "Partly Cloudy";
+            else if (c == "clear-night") label = "Clear Night";
+            else if (c == "lightning-rainy") label = "Storms";
+            else if (c == "rainy") label = "Rain";
+            else if (c == "pouring") label = "Heavy Rain";
+            else if (c == "sunny") label = "Sunny";
+            else if (c == "cloudy") label = "Cloudy";
+            else if (c == "fog") label = "Fog";
+            it.printf(24, 302, id(font_medium), COLOR_OFF, "%s", label);
+          }
+
+          it.printf(260, 212, id(font_small), COLOR_OFF, "INSIDE");
+          if (id(temp_sensor).has_state()) {
+            it.printf(260, 240, id(font_large), COLOR_OFF, "%.0f F",
+                      id(temp_sensor).state * 1.8f + 32.0f);
+          }
+          if (id(hum_sensor).has_state()) {
+            it.printf(260, 302, id(font_medium), COLOR_OFF, "Hum %.0f%%",
+                      id(hum_sensor).state);
+          }
+          it.line(20, 356, 460, 356, COLOR_OFF);
+
+          // ---- Assistant note, word-wrapped for the tall canvas ----
+          if (id(assistant_note).has_state() && !id(assistant_note).state.empty()) {
+            it.printf(24, 372, id(font_small), COLOR_OFF, "${assistant_name}");
+            std::string note = id(assistant_note).state;
+            const int max_line = 38;
+            int y = 402;
+            std::string line, word;
+            auto flush_line = [&]() {
+              if (!line.empty() && y <= 496) {
+                it.printf(24, y, id(font_small), COLOR_OFF, "%s", line.c_str());
+                y += 26;
+                line.clear();
+              }
+            };
+            for (size_t i = 0; i <= note.size(); i++) {
+              char ch = i < note.size() ? note[i] : ' ';
+              if (ch == ' ' || ch == '\n') {
+                if ((int)(line.size() + word.size() + 1) > max_line) flush_line();
+                if (!line.empty()) line += ' ';
+                line += word;
+                word.clear();
+                if (ch == '\n') flush_line();
+              } else {
+                word += ch;
+              }
+            }
+            flush_line();
+          }
+
+          // ---- VOICE: the last push-to-talk exchange ----
+          if (!id(va_query).empty() && (millis() - id(last_chat_ms)) < 60000) {
+            int vy = 540;
+            int skip = id(reply_scroll);
+            it.line(20, 528, 460, 528, COLOR_OFF);
+            auto draw_wrapped = [&](const std::string &prefix, const std::string &text, int y_max) {
+              std::string full = prefix + text;
+              const int max_line = 38;
+              std::vector<std::string> wrapped;
+              std::string line, word;
+              for (size_t i = 0; i <= full.size(); i++) {
+                char ch = i < full.size() ? full[i] : ' ';
+                if (ch == ' ' || ch == '\n') {
+                  if ((int)(line.size() + word.size() + 1) > max_line && !line.empty()) {
+                    wrapped.push_back(line); line.clear();
+                  }
+                  if (!line.empty()) line += ' ';
+                  line += word; word.clear();
+                  if (ch == '\n' && !line.empty()) { wrapped.push_back(line); line.clear(); }
+                } else word += ch;
+              }
+              if (!line.empty()) wrapped.push_back(line);
+              // consume `skip` wrapped lines before painting — the scroll
+              for (auto &l : wrapped) {
+                if (skip > 0) { skip--; continue; }
+                if (vy <= y_max) {
+                  it.printf(24, vy, id(font_small), COLOR_OFF, "%s", l.c_str());
+                  vy += 26;
+                }
+              }
+            };
+            draw_wrapped("YOU: ", id(va_query), 590);
+            vy += 6;
+            draw_wrapped("${assistant_name}: ", id(va_reply), 738);
+          }
+
+          it.printf(24, 764, id(font_small), COLOR_OFF, "${assistant_name} - ${unit_label}");
+          if (!isnan(id(battery_level).state)) {
+            it.printf(456, 764, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT,
+                      "Battery %.0f%%", id(battery_level).state);
+          }
+      - id: page_notes
+        lambda: |-
+          // ---- Page 2: Notes & Chat (full screen, nothing clipped) ----
+          it.printf(24, 18, id(font_medium), COLOR_OFF, "Notes & Chat");
+          auto now = id(rtc_time).now();
+          if (now.is_valid()) {
+            it.strftime(456, 26, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "%I:%M %p", now);
+          }
+          it.line(20, 62, 460, 62, COLOR_OFF);
+          int vy = 80;
+          int skip = id(reply_scroll);
+          auto draw_wrapped = [&](const std::string &prefix, const std::string &text, int y_max) {
+            std::string full = prefix + text;
+            const int max_line = 38;
+            std::vector<std::string> wrapped;
+            std::string line, word;
+            for (size_t i = 0; i <= full.size(); i++) {
+              char ch = i < full.size() ? full[i] : ' ';
+              if (ch == ' ' || ch == '\n') {
+                if ((int)(line.size() + word.size() + 1) > max_line && !line.empty()) {
+                  wrapped.push_back(line); line.clear();
+                }
+                if (!line.empty()) line += ' ';
+                line += word; word.clear();
+                if (ch == '\n' && !line.empty()) { wrapped.push_back(line); line.clear(); }
+              } else word += ch;
+            }
+            if (!line.empty()) wrapped.push_back(line);
+            // consume `skip` wrapped lines before painting — the scroll
+            for (auto &l : wrapped) {
+              if (skip > 0) { skip--; continue; }
+              if (vy <= y_max) {
+                it.printf(24, vy, id(font_small), COLOR_OFF, "%s", l.c_str());
+                vy += 26;
+              }
+            }
+          };
+          if (id(assistant_note).has_state() && !id(assistant_note).state.empty()) {
+            it.printf(24, vy, id(font_small), COLOR_OFF, "${assistant_name}");
+            vy += 30;
+            draw_wrapped("", id(assistant_note).state, 356);
+            vy += 12;
+          }
+          if (!id(va_query).empty()) {
+            it.line(20, vy, 460, vy, COLOR_OFF);
+            vy += 16;
+            draw_wrapped("YOU: ", id(va_query), 460);
+            vy += 6;
+            draw_wrapped("${assistant_name}: ", id(va_reply), 726);
+          }
+          it.printf(24, 764, id(font_small), COLOR_OFF, "Page 2 of 8");
+          it.printf(456, 764, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "UP: back");
+      - id: page_shopping
+        lambda: |-
+          // ---- Page 3: Shopping List (HA todo, live via bridge sensor) ----
+          it.printf(24, 18, id(font_medium), COLOR_OFF, "Shopping List");
+          auto now = id(rtc_time).now();
+          if (now.is_valid()) {
+            it.strftime(456, 26, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "%I:%M %p", now);
+          }
+          it.line(20, 62, 460, 62, COLOR_OFF);
+          int y = 84;
+          int count = 0;
+          if (id(ha_shopping).has_state() && !id(ha_shopping).state.empty()) {
+            std::string items = id(ha_shopping).state;
+            std::string line;
+            for (size_t i = 0; i <= items.size(); i++) {
+              char ch = i < items.size() ? items[i] : '\n';
+              if (ch == '\n') {
+                if (!line.empty() && y <= 700) {
+                  if (line.size() > 25) line = line.substr(0, 24) + "...";
+                  it.printf(24, y, id(font_medium), COLOR_OFF, "- %s", line.c_str());
+                  // tap this circle to check the item off
+                  it.circle(436, y + 10, 14, COLOR_OFF);
+                  it.circle(436, y + 10, 13, COLOR_OFF);
+                  y += 42;
+                  count++;
+                }
+                line.clear();
+              } else {
+                line += ch;
+              }
+            }
+          }
+          if (count == 0) {
+            it.printf(24, 84, id(font_medium), COLOR_OFF, "Nothing on the list!");
+          }
+          it.printf(24, 764, id(font_small), COLOR_OFF, "Page 3 of 8");
+          it.printf(456, 764, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "UP: back");
+      - id: page_today
+        lambda: |-
+          // ---- Page 4: Today / agenda (HA bridge sensor) ----
+          auto now = id(rtc_time).now();
+          if (now.is_valid()) {
+            it.strftime(24, 18, id(font_medium), COLOR_OFF, "%A, %B %d", now);
+            it.strftime(456, 26, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "%I:%M %p", now);
+          } else {
+            it.printf(24, 18, id(font_medium), COLOR_OFF, "Today");
+          }
+          it.line(20, 62, 460, 62, COLOR_OFF);
+          int y = 84;
+          std::string cur_day;
+          if (id(ha_agenda).has_state() && !id(ha_agenda).state.empty()) {
+            std::string all = id(ha_agenda).state;
+            std::string line;
+            for (size_t i = 0; i <= all.size() && y <= 700; i++) {
+              char ch = i < all.size() ? all[i] : '\n';
+              if (ch != '\n') { line += ch; continue; }
+              if (line.empty()) continue;
+              size_t p1 = line.find('|'), p2 = line.find('|', p1 + 1);
+              if (p1 == std::string::npos || p2 == std::string::npos) { line.clear(); continue; }
+              std::string day = line.substr(0, p1);
+              std::string tm = line.substr(p1 + 1, p2 - p1 - 1);
+              std::string title = line.substr(p2 + 1);
+              if (title.size() > 24) title = title.substr(0, 23) + "...";
+              if (day != cur_day) {
+                cur_day = day;
+                y += (y > 84) ? 14 : 0;
+                it.printf(24, y, id(font_small), COLOR_OFF, "%s", day.c_str());
+                y += 30;
+              }
+              if (tm.empty()) {
+                it.printf(24, y, id(font_medium), COLOR_OFF, "- %s", title.c_str());
+              } else {
+                it.printf(24, y, id(font_medium), COLOR_OFF, "%s  %s", tm.c_str(), title.c_str());
+              }
+              y += 40;
+              line.clear();
+            }
+          }
+          if (y == 84) {
+            it.printf(24, 96, id(font_medium), COLOR_OFF, "Nothing scheduled. Enjoy it.");
+          }
+          it.printf(24, 764, id(font_small), COLOR_OFF, "Page 4 of 8");
+          it.printf(456, 764, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "UP: back");
+      - id: page_weather
+        lambda: |-
+          // ---- Page 5: Weather, 3-day (HA bridge sensor) ----
+          it.printf(24, 18, id(font_medium), COLOR_OFF, "Weather");
+          auto now = id(rtc_time).now();
+          if (now.is_valid()) {
+            it.strftime(456, 26, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "%I:%M %p", now);
+          }
+          it.line(20, 62, 460, 62, COLOR_OFF);
+          if (id(ha_out_temp).has_state()) {
+            it.printf(24, 84, id(font_small), COLOR_OFF, "NOW");
+            it.printf(24, 112, id(font_xl), COLOR_OFF, "%.0f", id(ha_out_temp).state);
+            if (id(ha_weather).has_state()) {
+              it.printf(200, 140, id(font_medium), COLOR_OFF, "%s", id(ha_weather).state.c_str());
+            }
+          }
+          int y = 250;
+          if (id(ha_forecast).has_state() && !id(ha_forecast).state.empty()) {
+            std::string all = id(ha_forecast).state;
+            std::string line;
+            for (size_t i = 0; i <= all.size() && y <= 660; i++) {
+              char ch = i < all.size() ? all[i] : '\n';
+              if (ch != '\n') { line += ch; continue; }
+              if (line.empty()) continue;
+              // day|condition|hi|lo|rain%
+              std::string f[5];
+              size_t start = 0;
+              for (int k = 0; k < 5; k++) {
+                size_t p = line.find('|', start);
+                f[k] = line.substr(start, p == std::string::npos ? std::string::npos : p - start);
+                if (p == std::string::npos) break;
+                start = p + 1;
+              }
+              it.line(20, y - 10, 460, y - 10, COLOR_OFF);
+              it.printf(24, y, id(font_medium), COLOR_OFF, "%s", f[0].c_str());
+              it.printf(24, y + 40, id(font_small), COLOR_OFF, "%s", f[1].c_str());
+              it.printf(456, y, id(font_large), COLOR_OFF, TextAlign::TOP_RIGHT, "%s/%s", f[2].c_str(), f[3].c_str());
+              if (!f[4].empty() && f[4] != "0") {
+                it.printf(456, y + 52, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "rain %s%%", f[4].c_str());
+              }
+              y += 132;
+              line.clear();
+            }
+          } else {
+            it.printf(24, 260, id(font_medium), COLOR_OFF, "forecast bridge warming up...");
+          }
+          it.printf(24, 764, id(font_small), COLOR_OFF, "Page 5 of 8");
+          it.printf(456, 764, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "UP: back");
+      - id: page_lights
+        lambda: |-
+          // ---- Page 6: Lights switchboard (touch) ----
+          // Geometry MUST mirror the on_release hit-test: rows y=90+i*100,
+          // circles cx=260+j*80 r=30; room-name zone is x<230.
+          it.printf(24, 18, id(font_medium), COLOR_OFF, "Lights");
+          auto now = id(rtc_time).now();
+          if (now.is_valid()) {
+            it.strftime(456, 26, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "%I:%M %p", now);
+          }
+          it.line(20, 62, 460, 62, COLOR_OFF);
+          static const char *ROOMS[6] = {"${room_1_label}", "${room_2_label}",
+            "${room_3_label}", "${room_4_label}", "${room_5_label}", "${room_6_label}"};
+          static const int COUNTS[6]  = {3, 3, 3, 2, 2, 1};
+          static const int OFFSETS[6] = {0, 3, 6, 9, 11, 13};
+          text_sensor::TextSensor *ls_all[14] = {
+            id(ls_0), id(ls_1), id(ls_2), id(ls_3), id(ls_4), id(ls_5), id(ls_6),
+            id(ls_7), id(ls_8), id(ls_9), id(ls_10), id(ls_11), id(ls_12), id(ls_13)};
+          for (int i = 0; i < 6; i++) {
+            int cy = 90 + i * 100 + 50;
+            it.printf(24, cy - 14, id(font_medium), COLOR_OFF, "%s", ROOMS[i]);
+            for (int j = 0; j < COUNTS[i]; j++) {
+              int cx = 260 + j * 80;
+              auto *s = ls_all[OFFSETS[i] + j];
+              bool known = s->has_state();
+              bool on = known && s->state == "on";
+              bool unavail = !known || s->state == "unavailable";
+              if (on) {
+                it.filled_circle(cx, cy, 30, COLOR_OFF);
+              } else {
+                it.circle(cx, cy, 30, COLOR_OFF);
+                it.circle(cx, cy, 29, COLOR_OFF);
+              }
+              if (unavail) {
+                it.line(cx - 21, cy + 21, cx + 21, cy - 21, COLOR_OFF);
+              }
+            }
+          }
+          it.printf(24, 720, id(font_small), COLOR_OFF, "tap = toggle - room name = all - Fan = the fan");
+          it.printf(24, 764, id(font_small), COLOR_OFF, "Page 6 of 8");
+          it.printf(456, 764, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "UP: back");
+      - id: page_timers
+        lambda: |-
+          // ---- Page 7: Timers + big clock ----
+          auto now = id(rtc_time).now();
+          it.printf(24, 18, id(font_medium), COLOR_OFF, "Timers");
+          it.line(20, 62, 460, 62, COLOR_OFF);
+          if (now.is_valid()) {
+            it.strftime(240, 110, id(font_xl), COLOR_OFF, TextAlign::TOP_CENTER, "%I:%M %p", now);
+            it.strftime(240, 210, id(font_small), COLOR_OFF, TextAlign::TOP_CENTER, "%A, %B %d", now);
+          }
+          it.line(20, 270, 460, 270, COLOR_OFF);
+          int y = 300;
+          int shown = 0;
+          if (!id(timers_state).empty() && now.is_valid()) {
+            auto ts = now.timestamp;
+            std::string all = id(timers_state);
+            std::string line;
+            for (size_t i = 0; i <= all.size() && y <= 680; i++) {
+              char ch = i < all.size() ? all[i] : '\n';
+              if (ch != '\n') { line += ch; continue; }
+              if (line.empty()) continue;
+              size_t p0 = line.find('|');
+              if (p0 == std::string::npos) { line.clear(); continue; }
+              size_t p = line.find('|', p0 + 1);
+              if (p == std::string::npos) { line.clear(); continue; }
+              std::string name = line.substr(p0 + 1, p - p0 - 1);
+              long endt = atol(line.substr(p + 1).c_str());
+              long left = endt - (long) ts;
+              if (left > 0) {
+                if (name.size() > 16) name = name.substr(0, 15) + "...";
+                it.printf(24, y, id(font_medium), COLOR_OFF, "%s", name.c_str());
+                it.printf(456, y, id(font_large), COLOR_OFF, TextAlign::TOP_RIGHT,
+                          "%ld:%02ld", left / 60, left % 60);
+                y += 76;
+                shown++;
+              }
+              line.clear();
+            }
+          }
+          if (shown == 0) {
+            it.printf(240, 320, id(font_medium), COLOR_OFF, TextAlign::TOP_CENTER, "No active timers");
+            it.printf(240, 370, id(font_small), COLOR_OFF, TextAlign::TOP_CENTER, "\"set a timer for 10 minutes\"");
+          }
+          it.printf(24, 764, id(font_small), COLOR_OFF, "Page 7 of 8 - times as of refresh");
+          it.printf(456, 764, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "UP: back");
+      - id: page_board
+        lambda: |-
+          // ---- Page 8: the Household Board ----
+          it.printf(24, 18, id(font_medium), COLOR_OFF, "Board");
+          auto now = id(rtc_time).now();
+          if (now.is_valid()) {
+            it.strftime(456, 26, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "%I:%M %p", now);
+          }
+          it.line(20, 62, 460, 62, COLOR_OFF);
+          bool have = id(hb_text).has_state() && !id(hb_text).state.empty()
+                      && id(hb_text).state != "unknown";
+          if (have) {
+            // the note, big — wrapped at ~17 chars of font_large
+            std::string full = id(hb_text).state;
+            const int max_line = 17;
+            int y = 110;
+            std::string line, word;
+            for (size_t i = 0; i <= full.size() && y <= 600; i++) {
+              char ch = i < full.size() ? full[i] : ' ';
+              if (ch == ' ' || ch == '\n') {
+                if ((int)(line.size() + word.size() + 1) > max_line && !line.empty()) {
+                  it.printf(24, y, id(font_large), COLOR_OFF, "%s", line.c_str());
+                  y += 58; line.clear();
+                }
+                if (!line.empty()) line += ' ';
+                line += word; word.clear();
+                if (ch == '\n' && !line.empty()) {
+                  it.printf(24, y, id(font_large), COLOR_OFF, "%s", line.c_str());
+                  y += 58; line.clear();
+                }
+              } else word += ch;
+            }
+            if (!line.empty() && y <= 600) {
+              it.printf(24, y, id(font_large), COLOR_OFF, "%s", line.c_str());
+              y += 58;
+            }
+            if (id(hb_meta).has_state() && !id(hb_meta).state.empty()
+                && id(hb_meta).state != "unknown") {
+              it.printf(24, 660, id(font_small), COLOR_OFF, "%s", id(hb_meta).state.c_str());
+            }
+            // the X — tap to clear everywhere (hit zone x>=404, y>=700)
+            it.circle(436, 730, 22, COLOR_OFF);
+            it.line(427, 721, 445, 739, COLOR_OFF);
+            it.line(445, 721, 427, 739, COLOR_OFF);
+          } else {
+            it.printf(240, 300, id(font_medium), COLOR_OFF, TextAlign::TOP_CENTER, "board's clear");
+            it.printf(240, 350, id(font_small), COLOR_OFF, TextAlign::TOP_CENTER, "press OK here and speak to leave a note");
+          }
+          it.printf(24, 764, id(font_small), COLOR_OFF, "Page 8 of 8");
+          it.printf(456, 764, id(font_small), COLOR_OFF, TextAlign::TOP_RIGHT, "UP: back");
+
+# -----------------------------------------------------------------------------
+# secrets.yaml (create alongside this config):
+# secrets.yaml（与本配置同目录创建）：
+#   wifi_ssid: "Your WiFi SSID"
+#   wifi_password: "Your WiFi Password"
+#   ota_password: "choose-a-strong-password"
+#   api_encryption_key: "generate with: openssl rand -base64 32"
+#
+# Install options / 安装方式：
+#   ESPHome Web:  https://web.esphome.io  (Chrome/Edge, pick the downloaded YAML)
+#   ESPHome CLI:  esphome run sticky-voice-companion.yaml
+# -----------------------------------------------------------------------------

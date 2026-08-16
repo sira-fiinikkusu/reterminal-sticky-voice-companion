@@ -1,0 +1,151 @@
+# Home Assistant configuration for the Sticky Voice Companion.
+# Merge these blocks into your configuration.yaml (or an included package),
+# then run "Developer tools -> Check configuration" and restart once — the
+# template:, input_text:, and input_boolean: domains must exist at boot.
+#
+# The firmware reads three bridge sensors (shopping, agenda, forecast) and
+# four helpers. Every entity id here matches the yaml's substitutions
+# defaults — if you rename one, update the matching substitution.
+
+template:
+  # --- Shopping list -> Sticky bridge. Trigger-based so the e-ink updates
+  # moments after the list changes anywhere (voice, app, automations).
+  - trigger:
+      - platform: state
+        entity_id: todo.shopping_list
+      - platform: time_pattern
+        minutes: "/15"
+      - platform: homeassistant
+        event: start
+    action:
+      - service: todo.get_items
+        target:
+          entity_id: todo.shopping_list
+        data:
+          status: needs_action
+        response_variable: shop
+    sensor:
+      - name: "Sticky Shopping Items"
+        unique_id: sticky_shopping_items
+        icon: mdi:cart-outline
+        state: >
+          {{ (shop['todo.shopping_list']['items'] | default([])) | count }}
+        attributes:
+          items_text: >
+            {{ (shop['todo.shopping_list']['items'] | default([]))
+               | map(attribute='summary') | list | join('\n') }}
+
+  # --- Calendar -> Sticky agenda bridge. Pipes the next 48h of events into
+  # one attribute the e-ink parses ("Today|14:00|Dentist" per line; all-day
+  # events carry a blank time). List YOUR calendars under target.
+  - trigger:
+      - platform: time_pattern
+        minutes: "/30"
+      - platform: homeassistant
+        event: start
+    action:
+      - service: calendar.get_events
+        target:
+          entity_id:
+            - calendar.home            # <- your calendars here
+        data:
+          start_date_time: "{{ now().replace(hour=0, minute=0, second=0).isoformat() }}"
+          duration:
+            hours: 48
+        response_variable: agenda
+    sensor:
+      - name: "Sticky Agenda"
+        unique_id: sticky_agenda
+        icon: mdi:calendar-today
+        state: >
+          {% set ns = namespace(n=0) %}
+          {% for cal, data in agenda.items() %}{% set ns.n = ns.n + (data['events'] | count) %}{% endfor %}
+          {{ ns.n }}
+        attributes:
+          events_text: >
+            {% set ns = namespace(evs=[]) %}
+            {% for cal, data in agenda.items() %}
+            {% for e in data['events'] %}
+            {% set st = e.start %}
+            {% set d = st[:10] %}
+            {% set tm = '' if 'T' not in st else st[11:16] %}
+            {% set day = 'Today' if d == now().date() | string else ('Tomorrow' if d == (now().date() + timedelta(days=1)) | string else d) %}
+            {% set ns.evs = ns.evs + [(d ~ (tm if tm else '00:00'), day ~ '|' ~ tm ~ '|' ~ e.summary)] %}
+            {% endfor %}
+            {% endfor %}
+            {{ ns.evs | sort | map(attribute=1) | list | join('\n') }}
+
+  # --- Daily forecast -> Sticky weather bridge. Three days as
+  # "Sun|sunny|94|77|20" (day|condition|hi|lo|rain%).
+  - trigger:
+      - platform: time_pattern
+        minutes: "/30"
+      - platform: homeassistant
+        event: start
+    action:
+      - service: weather.get_forecasts
+        target:
+          entity_id: weather.forecast_home
+        data:
+          type: daily
+        response_variable: fc
+    sensor:
+      - name: "Sticky Forecast"
+        unique_id: sticky_forecast
+        icon: mdi:weather-partly-cloudy
+        state: "{{ fc['weather.forecast_home']['forecast'] | count }}"
+        attributes:
+          forecast_text: >
+            {% set out = namespace(lines=[]) %}
+            {% for f in fc['weather.forecast_home']['forecast'][:3] %}
+            {% set day = 'Today' if loop.first else as_timestamp(f.datetime) | timestamp_custom('%A') %}
+            {% set out.lines = out.lines + [day ~ '|' ~ f.condition ~ '|' ~ (f.temperature | round(0)) ~ '|' ~ (f.templow | default('') | round(0)) ~ '|' ~ (f.precipitation_probability | default(0) | round(0))] %}
+            {% endfor %}
+            {{ out.lines | join('\n') }}
+
+  # --- OPTIONAL fleet health: "last check-in" heartbeat per unit. Deep sleep
+  # disconnects the ESPHome API, so every wake flips the battery sensor from
+  # unavailable back to a number — and the voltage/current sensors tick while
+  # awake. Stamping on all three means "last proof of life" in BOTH states.
+  - trigger:
+      - platform: state
+        entity_id:
+          - sensor.reterminal_sticky_battery_level
+          - sensor.reterminal_sticky_battery_voltage
+          - sensor.reterminal_sticky_battery_current
+        not_to:
+          - unavailable
+          - unknown
+    sensor:
+      - name: "Sticky One Last Check-in"
+        unique_id: sticky_one_last_checkin
+        device_class: timestamp
+        icon: mdi:clock-check-outline
+        state: "{{ now().isoformat() }}"
+  - binary_sensor:
+      - name: "Sticky One Missing"
+        unique_id: sticky_one_missing
+        device_class: problem
+        state: >
+          {{ states('sensor.sticky_one_last_check_in') not in ['unknown', 'unavailable']
+             and (now() - as_datetime(states('sensor.sticky_one_last_check_in'))).total_seconds() > 7200 }}
+
+input_text:
+  # The note slot an assistant/automation writes; shown on main + notes pages.
+  assistant_note:
+    name: Assistant note
+    max: 250
+  # The household board: one shared note mirrored across the whole fleet.
+  # Dictated on any unit, announced on the others, cleared by the on-screen X.
+  household_board:
+    name: Household board
+    max: 250
+  household_board_meta:
+    name: Household board meta
+    max: 100
+
+input_boolean:
+  # ON pins every unit awake (OTA sessions, debugging). OFF resumes the
+  # normal sleep cycle.
+  sticky_stay_awake:
+    name: Sticky stay awake

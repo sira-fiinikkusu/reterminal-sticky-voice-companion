@@ -1,0 +1,12 @@
+# Additional fleet unit — copy this file once per extra Sticky and flash it
+# instead of the base config. Only identity lives here; all hardware and
+# behavior come from the base file, so units can never drift apart.
+substitutions:
+  device_name: sticky-two
+  friendly_name: "Sticky Two"
+  unit_label: "Sticky Two"
+  # Per-unit art is optional — any 480x800 1-bit PNG.
+  etch_image: "art/placeholder_etch.png"
+
+packages:
+  base: !include sticky-voice-companion.yaml
