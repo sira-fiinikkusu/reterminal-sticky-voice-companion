@@ -100,6 +100,7 @@ esphome:
               // Wi-Fi provisioning, which happens on a phone with no device
               // interaction to extend the grace.
               id(rearm_delay_ms) = 900000;
+              id(cold_boot) = true;
             }
         - if:
             condition:
@@ -452,7 +453,11 @@ binary_sensor:
       if (isnan(id(battery_current).state)) {
         return false;
       }
-      return id(battery_current).state > 20.0f;
+      // On external power: USB carries the load, so battery current sits at
+      // ~0 (topped off) or positive (charging). An unplugged unit always
+      // draws visibly negative current. The stock >20mA check read "off"
+      // during top-off, which looks broken on a docked device.
+      return id(battery_current).state >= -5.0f;
 
   # SD card detect (GPIO11, LOW = card present)
   # SD 卡检测（GPIO11，低电平 = 卡已插入）
@@ -551,6 +556,8 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  on_connect:
+    - lambda: 'id(wifi_provisioned) = true;'
   ap:
     ssid: "reTerminal-Sticky"
     password: "ChangeMe123"
@@ -844,8 +851,17 @@ script:
       - while:
           condition:
             lambda: |-
+              // The last clause: a cold-booted, never-provisioned device
+              // holds awake for 20 minutes — device pokes must not be able
+              // to shorten the captive-portal window.
+              // Docked (on external power) = nothing to save: hold awake
+              // so HA stays live; unplugging resumes the sleep rhythm.
+              bool docked = !isnan(id(battery_current).state)
+                  && id(battery_current).state >= -5.0f;
               return id(stay_awake).state || !id(timers_state).empty()
-                  || id(va).is_running();
+                  || id(va).is_running() || docked
+                  || (id(cold_boot) && !id(wifi_provisioned)
+                      && millis() < 1200000);
           then:
             - delay: 30s
             - lambda: |-
@@ -983,6 +999,16 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '180000'
+  # Set on cold/reset boots only; with wifi_provisioned it gates the
+  # first-boot sleep hold so setup can't be interrupted.
+  - id: cold_boot
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: wifi_provisioned
+    type: bool
+    restore_value: no
+    initial_value: 'false'
   # Epoch of the last cadence paint; RTC-persisted across deep sleep.
   - id: last_sched_paint
     type: uint32_t
