@@ -40,6 +40,18 @@ household note that every Sticky in the house announces and mirrors.
   Wi-Fi hotspot with a captive portal, and supports Improv over USB serial,
   so a freshly flashed device can join your network without editing yaml.
 
+## In the flesh
+
+| Fresh off the flash page | Shopping list | Lights |
+|---|---|---|
+| ![Main page, out of the box](docs/main-page.jpg) | ![Shopping list](docs/shopping.jpg) | ![Lights page](docs/lights.jpg) |
+
+Left: the public build exactly as flashed — clock and local climate live, HA
+fields waiting for adoption, the placeholder etch behind. Middle and right:
+the maintainer's own units in daily service (custom substitutions for the
+assistant name and watermark art; a filled dot is a light that's on, a
+slashed circle is one HA reports unavailable).
+
 ## Hardware notes this firmware carries
 
 Two fixes worth knowing about even if you never flash this firmware:
