@@ -74,6 +74,12 @@ Also encoded in the config, learned the hard way:
 
 ## Setup
 
+0. **Flashing from the Playground?** After the flash, the device raises a
+   `reTerminal-Sticky` hotspot — join it and the captive portal walks you
+   through Wi-Fi (networks blurred here for the neighbors' privacy):
+
+   ![Captive portal](docs/captive-portal.png)
+
 1. **Home Assistant helpers first:** merge `homeassistant.example.yaml` into
    your configuration — three small bridge sensors (shopping list, agenda,
    forecast), the board/note helpers, and the stay-awake toggle. Check
